@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local configuration and private runtime data
+.env
+.venv/
+bot.log*
+index.db*
+files/
+.vscode/
