@@ -42,6 +42,7 @@ def read_txt(p):
 
 
 def _table(rows, prefix=""):
+    """Use the first non-empty row as headers and attach cell values to later rows."""
     headers = None
     for i, raw in enumerate(rows, 1):
         cells = ["" if c is None else str(c).strip() for c in raw]
@@ -89,7 +90,7 @@ def read_pdf(p):
     reader = PdfReader(p)
     if reader.is_encrypted:
         try:
-            reader.decrypt("")
+            reader.decrypt("")          # Some locked PDFs allow an empty password.
         except Exception:
             raise ValueError("PDF is password-protected")
     for n, page in enumerate(reader.pages, 1):
@@ -110,6 +111,7 @@ QUERY_RE = re.compile(r'([^\W\d]\w*):(?:"([^"]+)"|(\w+))|"([^"]+)"|(\w+)')
 
 
 def parse_query(q):
+    """Parse search terms and column filters, including quoted phrases."""
     terms, filters = [], []
     for key, qv, v, phrase, word in QUERY_RE.findall(q):
         if key:
@@ -131,6 +133,7 @@ def _tok_match(t, ct, fuzzy):
 
 
 def _header_matches(key, header):
+    """Allow a column prefix such as 'first' to match 'First Name'."""
     nk = re.sub(r"[\W_]+", "", key)
     if nk == re.sub(r"[\W_]+", "", header.lower()):
         return True
@@ -155,7 +158,7 @@ def _filters_ok(fields_json, filters, fuzzy):
     return True
 
 
-BATCH = 20_000
+BATCH = 20_000                 # Commit in batches to keep memory use bounded.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL, size INTEGER);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
@@ -180,7 +183,7 @@ class Index:
         self.folder = Path(folder)
         self.db_path = str(db_path)
         self._locks_guard = threading.Lock()
-        self._file_locks = {}
+        self._file_locks = {}            # Per-file locks let uploads proceed during a sync.
         # vocab bucketed by first letter for fast fuzzy narrowing
         self._vocab_by_letter: dict[str, list[str]] = {}
         self._vocab_loaded = False
@@ -188,6 +191,7 @@ class Index:
         self._cache_lock = threading.Lock()
         self._enable_wal()
         with self._conn() as c:
+            # Create auxiliary metadata tables without replacing existing FTS data.
             c.executescript(SCHEMA)
             self._fts_fields = "fields" in {
                 row[1] for row in c.execute("PRAGMA table_info(chunks)")
@@ -208,13 +212,14 @@ class Index:
                     raise
                 if time.monotonic() >= deadline:
                     raise sqlite3.OperationalError(
-                        f"Timed out enabling WAL for {self.db_path}") from exc
+                        f"Timed out enabling WAL for {self.db_path}; "
+                        "the database is still locked by another connection") from exc
                 time.sleep(0.1)
 
     @contextmanager
     def _conn(self, timeout=30):
         c = sqlite3.connect(self.db_path, timeout=timeout)
-        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA synchronous=NORMAL")      # Safe with WAL; faster bulk inserts.
         try:
             yield c
             c.commit()
@@ -246,6 +251,7 @@ class Index:
             log.warning("FTS5 optimize failed (non-fatal)", exc_info=True)
 
     def index_file(self, path):
+        """Reindex one file; return its entry count, or None if reading failed."""
         path = Path(path)
         reader = READERS.get(path.suffix.lower())
         if not reader:
@@ -256,10 +262,11 @@ class Index:
                 st = path.stat()
                 with self._conn() as c:
                     known = c.execute("SELECT 1 FROM files WHERE path=?", (rel,)).fetchone()
-                    if known:
+                    if known:       # Avoid a delete scan when this is a new file.
                         c.execute("DELETE FROM chunks WHERE file=?", (rel,))
                         c.execute("DELETE FROM cols WHERE file=?", (rel,))
                         c.execute("DELETE FROM row_fields WHERE file=?", (rel,))
+                    # An interrupted index is retried by sync() because its size is -1.
                     c.execute("INSERT OR REPLACE INTO files VALUES (?,?,?)", (rel, 0, -1))
                 total, headers, batch = 0, {}, []
                 for item in reader(path):
@@ -315,6 +322,7 @@ class Index:
         self._invalidate_cache()
 
     def sync(self):
+        """Bring the index in line with the folder; return (indexed, removed)."""
         on_disk = {str(p.relative_to(self.folder)): p
                    for p in self.folder.rglob("*")
                    if p.is_file() and p.suffix.lower() in READERS}
@@ -385,6 +393,7 @@ class Index:
         return html.escape(snip).replace(HL_START, "<b>").replace(HL_END, "</b>")
 
     def _run(self, match, limit):
+        """Return ranked results with highlighted snippets when no filters are used."""
         sql = ("SELECT file, loc, snippet(chunks, 2, char(1), char(2), '…', 24) "
                "FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?")
         try:
@@ -395,6 +404,7 @@ class Index:
             return []
 
     def _run_filtered(self, match, filters, fuzzy, limit):
+        """Filter ranked candidates first, then generate snippets only for matches."""
         # Cap candidates at 2000 (down from 5000) — enough for real-world data,
         # much faster to process in Python.
         CAND_CAP = 2000
@@ -429,6 +439,7 @@ class Index:
         return [(f, w, self._fmt(snips.get(rid, ""))) for rid, f, w, _ in keep]
 
     def _search(self, terms, filters, fuzzy, limit):
+        # Filter values narrow FTS candidates before exact column checks are applied.
         fts_terms = terms + [("word", t) for _, v in filters for t in re.findall(r"\w+", v)]
         if not fts_terms:
             return []
@@ -468,6 +479,7 @@ class Index:
         return out
 
     def columns(self):
+        """Return indexed spreadsheet headers grouped by file."""
         with self._conn() as c:
             out = {}
             for f, h in c.execute(
